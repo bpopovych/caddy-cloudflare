@@ -1,0 +1,98 @@
+name: Build and Push Docker Image
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Check for upstream updates
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      caddy_version: ${{ steps.check.outputs.caddy_version }}
+    steps:
+      - name: Check upstream versions
+        id: check
+        run: |
+          # Get latest Caddy version from Docker Hub
+          CADDY_VERSION=$(curl -s "https://hub.docker.com/v2/repositories/library/caddy/tags/?page_size=100" \
+            | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "caddy_version=${CADDY_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Get current caddy:alpine digest
+          UPSTREAM_DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/library/caddy/tags/?page_size=100" \
+            | jq -r '.results[] | select(.name == "alpine") | .digest')
+
+          # Get our image's digest of the base layer (stored as label)
+          OUR_DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/bpopovych/caddy-cloudflare/tags/?page_size=10" \
+            | jq -r '.results[] | select(.name == "latest") | .digest' 2>/dev/null || echo "none")
+
+          # Get latest caddy-dns/cloudflare module version
+          CF_VERSION=$(curl -s "https://api.github.com/repos/caddy-dns/cloudflare/releases/latest" \
+            | jq -r '.tag_name // empty')
+          if [ -z "$CF_VERSION" ]; then
+            CF_VERSION=$(curl -s "https://api.github.com/repos/caddy-dns/cloudflare/tags" \
+              | jq -r '.[0].name // "unknown"')
+          fi
+
+          echo "Upstream caddy:alpine digest: ${UPSTREAM_DIGEST}"
+          echo "Our image digest: ${OUR_DIGEST}"
+          echo "Caddy version: ${CADDY_VERSION}"
+          echo "Cloudflare module version: ${CF_VERSION}"
+
+          # Always build on push/manual trigger; on schedule, build if digests differ or our image doesn't exist
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$OUR_DIGEST" = "none" ] || [ "$UPSTREAM_DIGEST" != "$OUR_DIGEST" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes detected, skipping build."
+          fi
+
+  build:
+    name: Build multi-platform image
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: bpopovych/caddy-cloudflare
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.check.outputs.caddy_version }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v6,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/s390x
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=Caddy with Cloudflare DNS
+            org.opencontainers.image.description=Caddy web server with caddy-dns/cloudflare module for DNS-01 ACME validation
+            org.opencontainers.image.source=https://github.com/bpopovych/caddy-cloudflare
+            org.opencontainers.image.version=${{ needs.check.outputs.caddy_version }}
